@@ -22,7 +22,7 @@ import abc
 import bisect
 import hashlib
 import os
-from typing import Any, Dict, List, Text
+from typing import Any, Dict, List, Text, Union
 
 import absl
 import apache_beam as beam
@@ -44,31 +44,52 @@ INPUT_KEY = 'input'
 # Key for output examples in executor output_dict.
 EXAMPLES_KEY = 'examples'
 
+# Key for payload_format custom property of output examples artifact.
+PAYLOAD_FORMAT_PROPERTY_KEY = 'payload_format'
 
-def _PartitionFn(record: bytes, num_partitions: int, buckets: List[int],
-                 split_config: example_gen_pb2.SplitConfig) -> int:
+
+def _ExamplePartitionKey(record: tf.train.Example,
+                         split_config: example_gen_pb2.SplitConfig) -> bytes:
+  """Generates key for partition for tf.train.Example."""
+
+  if not split_config.HasField('partition_feature_name'):
+    return record.SerializeToString(deterministic=True)
+
+  # Use a feature for partitioning the examples.
+  feature_name = split_config.partition_feature_name
+  if feature_name not in record.features.feature:
+    raise RuntimeError('Feature name `{}` does not exist.'.format(feature_name))
+  feature = record.features.feature[feature_name]
+  if not feature.HasField('kind'):
+    raise RuntimeError('Partition feature does not contain any value.')
+  if (not feature.HasField('bytes_list') and
+      not feature.HasField('int64_list')):
+    raise RuntimeError(
+        'Only `bytes_list` and `int64_list` features are supported for partition.'
+    )
+  return feature.SerializeToString(deterministic=True)
+
+
+def _PartitionFn(
+    record: Union[tf.train.Example, bytes],
+    num_partitions: int,
+    buckets: List[int],
+    split_config: example_gen_pb2.SplitConfig,
+) -> int:
   """Partition function for the ExampleGen's output splits."""
   assert num_partitions == len(
       buckets), 'Partitions do not match bucket number.'
-  partition_str = record
-  if split_config.HasField('partition_feature_name'):
-    # Use a feature for partitioning the examples.
-    feature_name = split_config.partition_feature_name
-    # Deserialize the record to tf.train.Example.
-    example = tf.train.Example()
-    example.ParseFromString(record)
-    if feature_name not in example.features.feature:
-      raise RuntimeError(
-          'Feature name `{}` does not exist.'.format(feature_name))
-    feature = example.features.feature[feature_name]
-    if not feature.HasField('kind'):
-      raise RuntimeError('Partition feature does not contain any value.')
-    if (not feature.HasField('bytes_list') and
-        not feature.HasField('int64_list')):
-      raise RuntimeError(
-          'Only `bytes_list` and `int64_list` features are supported for partition.'
-      )
-    partition_str = feature.SerializeToString(deterministic=True)
+
+  if not isinstance(record, tf.train.Example) and split_config.HasField(
+      'partition_feature_name'):
+    raise RuntimeError('Split by `partition_feature_name` is only supported '
+                       'for FORMAT_TF_EXAMPLE payload format.')
+
+  if isinstance(record, tf.train.Example):
+    partition_str = _ExamplePartitionKey(record, split_config)
+  else:
+    partition_str = record
+
   bucket = int(hashlib.sha256(partition_str).hexdigest(), 16) % buckets[-1]
   # For example, if buckets is [10,50,80], there will be 3 splits:
   #   bucket >=0 && < 10, returns 0
@@ -78,14 +99,21 @@ def _PartitionFn(record: bytes, num_partitions: int, buckets: List[int],
 
 
 @beam.ptransform_fn
-@beam.typehints.with_input_types(bytes)
+@beam.typehints.with_input_types(Union[bytes, tf.train.Example])
 @beam.typehints.with_output_types(beam.pvalue.PDone)
 def _WriteSplit(example_split: beam.pvalue.PCollection,
                 output_split_path: Text) -> beam.pvalue.PDone:
-  """Shuffles and writes output split."""
+  """Shuffles and writes output split as serialized records in TFRecord."""
+
+  def _MaybeSerialize(x):
+    # Returns deterministic string as partition is based on it.
+    return x.SerializeToString(
+        deterministic=True) if isinstance(x, tf.train.Example) else x
+
   return (example_split
           # TODO(jyzhao): make shuffle optional.
           | 'Shuffle' >> beam.transforms.Reshuffle()
+          | 'SerializeDeterministically' >> beam.Map(_MaybeSerialize)
           # TODO(jyzhao): multiple output format.
           | 'Write' >> beam.io.WriteToTFRecord(
               os.path.join(output_split_path, DEFAULT_FILE_NAME),
@@ -94,19 +122,18 @@ def _WriteSplit(example_split: beam.pvalue.PCollection,
 
 @beam.ptransform_fn
 @beam.typehints.with_input_types(beam.Pipeline)
-@beam.typehints.with_output_types(bytes)
-def _InputToSerializedExample(pipeline: beam.Pipeline,
-                              input_to_example: beam.PTransform,
-                              input_dict: Dict[Text, List[types.Artifact]],
-                              exec_properties: Dict[Text, Any],
-                              split_pattern: Text) -> beam.pvalue.PCollection:
-  """Converts input to serialized TF examples."""
+@beam.typehints.with_output_types(Union[tf.train.Example, bytes])
+def _InputToExampleOrSerializedProto(
+    pipeline: beam.Pipeline,
+    input_to_example: beam.PTransform,
+    input_dict: Dict[Text, List[types.Artifact]],
+    exec_properties: Dict[Text, Any],
+    split_pattern: Text,
+) -> beam.pvalue.PCollection:
+  """Converts input into a tf.train.Example, or a serialized proto."""
   return (pipeline
-          | 'InputSourceToExample' >> input_to_example(
-              input_dict, exec_properties, split_pattern)
-          # Returns deterministic string as partition is based on it.
-          | 'SerializeDeterministically' >>
-          beam.Map(lambda x: x.SerializeToString(deterministic=True)))
+          | 'InputSourceToExampleOrSerializedProto' >> input_to_example(
+              input_dict, exec_properties, split_pattern))
 
 
 class BaseExampleGenExecutor(
@@ -137,7 +164,11 @@ class BaseExampleGenExecutor(
 
   @abc.abstractmethod
   def GetInputSourceToExamplePTransform(self) -> beam.PTransform:
-    """Returns PTransform for converting input source to TF examples.
+    """Returns PTransform for converting input source to records.
+
+    The record is by default, and intended to be, TF Exampele protos, but
+    subclassses can serialize any protocol buffer into bytes as output
+    PCollection, so long as the downstream component can consume it.
 
     Note that each input split will be transformed by this function separately.
     For complex use case, consider override 'GenerateExamplesByBeam' instead.
@@ -154,10 +185,30 @@ class BaseExampleGenExecutor(
     """
     pass
 
+  def PayloadFormat(
+      self, exec_properties: Dict[Text, Any]) -> example_gen_pb2.PayloadFormat:
+    """Returns anticipated payload_format of output.
+
+    Subclass should override and determine emitted payload type.
+
+    Args:
+      exec_properties: A dict of execution properties. Depends on detailed
+        example gen implementation.
+
+    Returns:
+      An instance of example_gen_pb2.PayloadFormat enum
+    """
+    del exec_properties
+    # Unless otherwise overridden in subclass, BaseExampleGenExecutor assumes
+    # generating tf.train.Example protocol buffers as payload.
+    return example_gen_pb2.PayloadFormat.FORMAT_TF_EXAMPLE
+
   def GenerateExamplesByBeam(
-      self, pipeline: beam.Pipeline, input_dict: Dict[Text,
-                                                      List[types.Artifact]],
-      exec_properties: Dict[Text, Any]) -> Dict[Text, beam.pvalue.PCollection]:
+      self,
+      pipeline: beam.Pipeline,
+      input_dict: Dict[Text, List[types.Artifact]],
+      exec_properties: Dict[Text, Any],
+  ) -> Dict[Text, beam.pvalue.PCollection]:
     """Converts input source to TF example splits based on configs.
 
     Custom ExampleGen executor should provide GetInputSourceToExamplePTransform
@@ -209,9 +260,11 @@ class BaseExampleGenExecutor(
         buckets.append(total_buckets)
       example_splits = (
           pipeline
-          | 'InputToSerializedExample' >> _InputToSerializedExample(  # pylint: disable=no-value-for-parameter
-              input_to_example, input_dict, exec_properties,
-              input_config.splits[0].pattern)
+          | 'InputToExampleOrSerializedProto' >>
+          # pylint: disable=no-value-for-parameter
+          _InputToExampleOrSerializedProto(input_to_example, input_dict,
+                                           exec_properties,
+                                           input_config.splits[0].pattern)
           | 'SplitData' >> beam.Partition(_PartitionFn, len(buckets), buckets,
                                           output_config.split_config))
     else:
@@ -219,9 +272,10 @@ class BaseExampleGenExecutor(
       for split in input_config.splits:
         examples = (
             pipeline
-            | 'InputToSerializedExample[{}]'.format(split.name) >>
-            _InputToSerializedExample(  # pylint: disable=no-value-for-parameter
-                input_to_example, input_dict, exec_properties, split.pattern))
+            | 'InputToExampleOrSerializedProto[{}]'.format(split.name) >>
+            # pylint: disable=no-value-for-parameter
+            _InputToExampleOrSerializedProto(input_to_example, input_dict,
+                                             exec_properties, split.pattern))
         example_splits.append(examples)
 
     result = {}
@@ -229,10 +283,19 @@ class BaseExampleGenExecutor(
       result[split_names[index]] = example_split
     return result
 
-  def Do(self, input_dict: Dict[Text, List[types.Artifact]],
-         output_dict: Dict[Text, List[types.Artifact]],
-         exec_properties: Dict[Text, Any]) -> None:
-    """Take input data source and generates TF Example splits.
+  def Do(
+      self,
+      input_dict: Dict[Text, List[types.Artifact]],
+      output_dict: Dict[Text, List[types.Artifact]],
+      exec_properties: Dict[Text, Any],
+  ) -> None:
+    """Take input data source and generates serialized data splits.
+
+    The output is intended to be serialized TF Examples in gzipped TFRecord
+    format, but subclasses can choose to override to write to any serialized
+    records payload into gzipped TFRecord, so long as downstream component
+    can consume it. Subclass should override self.PayloadFormat() to indicate
+    the format of payload.
 
     Args:
       input_dict: Input dict from input key to a list of Artifacts. Depends on
@@ -260,7 +323,13 @@ class BaseExampleGenExecutor(
       for split_name, example_split in example_splits.items():
         (example_split
          | 'WriteSplit[{}]'.format(split_name) >> _WriteSplit(
-             artifact_utils.get_split_uri(output_dict['examples'], split_name)))
+             artifact_utils.get_split_uri(output_dict[EXAMPLES_KEY],
+                                          split_name)))
       # pylint: enable=expression-not-assigned, no-value-for-parameter
 
+    for output_examples_artifact in output_dict[EXAMPLES_KEY]:
+      output_examples_artifact.set_string_custom_property(
+          PAYLOAD_FORMAT_PROPERTY_KEY,
+          example_gen_pb2.PayloadFormat.Name(
+              self.PayloadFormat(exec_properties)))
     absl.logging.info('Examples generated.')

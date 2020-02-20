@@ -13,6 +13,9 @@
     comprehensive solution for idempotent execution.
 *   Made evaluator output optional (while still recommended) for pusher.
 *   Moved BigQueryExampleGen to `tfx.extensions.google_cloud_big_query`.
+*   Supported non tf.train.Example protos as internal data payload format
+    by ImportExampleGen.
+
 ## Breaking changes
 
 ### For pipeline authors

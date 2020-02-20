@@ -129,6 +129,8 @@ class FileBasedExampleGenSpec(ComponentSpec):
           ExecutionParameter(type=example_gen_pb2.Output),
       'custom_config':
           ExecutionParameter(type=example_gen_pb2.CustomConfig, optional=True),
+      'payload_format':
+          ExecutionParameter(type=example_gen_pb2.PayloadFormat, optional=True),
   }
   INPUTS = {
       'input': ChannelParameter(type=standard_artifacts.ExternalArtifact),

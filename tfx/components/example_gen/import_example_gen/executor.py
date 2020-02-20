@@ -19,7 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import os
-from typing import Any, Dict, List, Text
+from typing import Any, Dict, List, Text, Union
 
 import absl
 import apache_beam as beam
@@ -28,18 +28,34 @@ import tensorflow as tf
 from tfx import types
 from tfx.components.example_gen.base_example_gen_executor import BaseExampleGenExecutor
 from tfx.components.example_gen.base_example_gen_executor import INPUT_KEY
+from tfx.proto import example_gen_pb2
 from tfx.types import artifact_utils
+
+
+CUSTOM_CONFIG_KEY = 'custom_config'
+PAYLOAD_FORMAT_KEY = 'payload_format'
+DEFAULT_PAYLOAD_FORMAT = example_gen_pb2.PayloadFormat.FORMAT_TF_EXAMPLE
+
+
+def _PayloadFormat(
+    exec_properties: Dict[Text, Any]) -> example_gen_pb2.PayloadFormat:
+  """Returns user-specified payload format in exec properties."""
+  payload_format = exec_properties.get(PAYLOAD_FORMAT_KEY)
+  if not payload_format:
+    return DEFAULT_PAYLOAD_FORMAT
+
+  return payload_format
 
 
 @beam.ptransform_fn
 @beam.typehints.with_input_types(beam.Pipeline)
-@beam.typehints.with_output_types(tf.train.Example)
-def _ImportExample(  # pylint: disable=invalid-name
+@beam.typehints.with_output_types(Union[bytes, tf.train.Example])
+def _ImportRecord(  # pylint: disable=invalid-name
     pipeline: beam.Pipeline,
     input_dict: Dict[Text, List[types.Artifact]],
     exec_properties: Dict[Text, Any],  # pylint: disable=unused-argument
     split_pattern: Text) -> beam.pvalue.PCollection:
-  """Read TFRecord files to PCollection of TF examples.
+  """Read TFRecord files to PCollection of recprds (most likely, TF examples).
 
   Note that each input split will be transformed by this function separately.
 
@@ -60,17 +76,28 @@ def _ImportExample(  # pylint: disable=invalid-name
       'Reading input TFExample data {}.'.format(input_split_pattern))
 
   # TODO(jyzhao): profile input examples.
-  return (pipeline
-          # TODO(jyzhao): support multiple input format.
-          | 'ReadFromTFRecord' >>
-          beam.io.ReadFromTFRecord(file_pattern=input_split_pattern)
-          # TODO(jyzhao): consider move serialization out of base example gen.
-          | 'ToTFExample' >> beam.Map(tf.train.Example.FromString))
+  records = (
+      pipeline
+      # TODO(jyzhao): support multiple input format.
+      | 'ReadFromTFRecord' >>
+      beam.io.ReadFromTFRecord(file_pattern=input_split_pattern))
+
+  if _PayloadFormat(
+      exec_properties) == example_gen_pb2.PayloadFormat.FORMAT_TF_EXAMPLE:
+    records = (records | 'ToTFExample' >> beam.Map(tf.train.Example.FromString))
+
+  return records
 
 
 class Executor(BaseExampleGenExecutor):
   """Generic TFX import example gen executor."""
 
+  def PayloadFormat(
+      self, exec_properties: Dict[Text, Any]) -> example_gen_pb2.PayloadFormat:
+    """Returns user-specified payload format in exec properties."""
+    return _PayloadFormat(exec_properties)
+
   def GetInputSourceToExamplePTransform(self) -> beam.PTransform:
-    """Returns PTransform for importing TF examples."""
-    return _ImportExample
+    """Returns PTransform for importing records."""
+    print(type(DEFAULT_PAYLOAD_FORMAT))
+    return _ImportRecord

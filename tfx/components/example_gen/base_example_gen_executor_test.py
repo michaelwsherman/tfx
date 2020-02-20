@@ -29,11 +29,10 @@ from tfx.types import standard_artifacts
 
 
 @beam.ptransform_fn
-def _TestInputSourceToExamplePTransform(
-    pipeline,
-    input_dict,  # pylint: disable=unused-argument
-    exec_properties,  # pylint: disable=unused-argument
-    split_pattern):
+def _TestInputSourceToExamplePTransform(pipeline, input_dict, exec_properties,
+                                        split_pattern):
+
+  del input_dict
   mock_examples = []
   size = 0
   if split_pattern == 'single/*':
@@ -58,7 +57,13 @@ def _TestInputSourceToExamplePTransform(
     example_proto = tf.train.Example(
         features=tf.train.Features(feature=feature))
     mock_examples.append(example_proto)
-  return pipeline | beam.Create(mock_examples)
+  records = pipeline | beam.Create(mock_examples)
+
+  if exec_properties.get('format_proto', False):
+    records = (
+        records | beam.Map(lambda x: x.SerializeToString(deterministic=True)))
+
+  return records
 
 
 class TestExampleGenExecutor(base_example_gen_executor.BaseExampleGenExecutor):
@@ -233,6 +238,28 @@ class BaseExampleGenExecutorTest(tf.test.TestCase):
         RuntimeError,
         'Only `bytes_list` and `int64_list` features are supported for partition.'
     ):
+      example_gen.Do({}, self._output_dict, self._exec_properties)
+
+  def testInvalidFeatureBasedPartitionWithProtos(self):
+    # Add output config to exec proterties.
+    self._exec_properties['output_config'] = json_format.MessageToJson(
+        example_gen_pb2.Output(
+            split_config=example_gen_pb2.SplitConfig(
+                splits=[
+                    example_gen_pb2.SplitConfig.Split(
+                        name='train', hash_buckets=2),
+                    example_gen_pb2.SplitConfig.Split(
+                        name='eval', hash_buckets=1)
+                ],
+                partition_feature_name='i')))
+    self._exec_properties['has_empty'] = False
+    self._exec_properties['format_proto'] = True
+
+    # Run executor.
+    example_gen = TestExampleGenExecutor()
+    with self.assertRaisesRegexp(
+        RuntimeError, 'Split by `partition_feature_name` is only supported for '
+        'FORMAT_TF_EXAMPLE payload format.'):
       example_gen.Do({}, self._output_dict, self._exec_properties)
 
 
