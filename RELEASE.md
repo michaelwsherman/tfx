@@ -2,6 +2,9 @@
 
 ## Major Features and Improvements
 
+*   Changed Span information as a property of ExampleGen's output artifact.
+    Deprecated ExampleGen input (external) artifact.
+
 ## Bug fixes and other changes
 *   Added Tuner component, which is still work in progress.
 *   Added Tuner component to Iris e2e example.
@@ -13,6 +16,11 @@
 ## Breaking changes
 
 ### For pipeline authors
+
+*   Changed ExampleGen to take a string as input source directly: Marked `input`
+    as deprecated, changed type of `input_base` to Text instead of Channel.
+*   Marked ExternalArtifact and `external_input` function as deprecated.
+*   Fully deprecated csv_input and tfrecord_input in dsl_utils.
 
 ### For component authors
 

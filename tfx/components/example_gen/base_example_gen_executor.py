@@ -24,7 +24,7 @@ import hashlib
 import os
 from typing import Any, Dict, List, Text
 
-import absl
+from absl import logging
 import apache_beam as beam
 from six import with_metaclass
 
@@ -37,11 +37,6 @@ from tfx.types import artifact_utils
 
 # Default file name for TFRecord output file prefix.
 DEFAULT_FILE_NAME = 'data_tfrecord'
-# Key for input in executor input_dict.
-INPUT_KEY = 'input'
-
-# Key for output examples in executor output_dict.
-EXAMPLES_KEY = 'examples'
 
 
 def _PartitionFn(record: bytes, num_partitions: int, buckets: List[int]) -> int:
@@ -160,10 +155,10 @@ class BaseExampleGenExecutor(
     """
     # Get input split information.
     input_config = example_gen_pb2.Input()
-    json_format.Parse(exec_properties['input_config'], input_config)
+    json_format.Parse(exec_properties[utils.INPUT_CONFIG_KEY], input_config)
     # Get output split information.
     output_config = example_gen_pb2.Output()
-    json_format.Parse(exec_properties['output_config'], output_config)
+    json_format.Parse(exec_properties[utils.OUTPUT_CONFIG_KEY], output_config)
     # Get output split names.
     split_names = utils.generate_output_split_names(input_config, output_config)
     # Make beam_pipeline_args available in exec_properties since certain
@@ -228,7 +223,7 @@ class BaseExampleGenExecutor(
     """
     self._log_startup(input_dict, output_dict, exec_properties)
 
-    absl.logging.info('Generating examples.')
+    logging.info('Generating examples.')
     with self._make_beam_pipeline() as pipeline:
       example_splits = self.GenerateExamplesByBeam(pipeline, input_dict,
                                                    exec_properties)
@@ -237,7 +232,8 @@ class BaseExampleGenExecutor(
       for split_name, example_split in example_splits.items():
         (example_split
          | 'WriteSplit[{}]'.format(split_name) >> _WriteSplit(
-             artifact_utils.get_split_uri(output_dict['examples'], split_name)))
+             artifact_utils.get_split_uri(output_dict[utils.EXAMPLES_KEY],
+                                          split_name)))
       # pylint: enable=expression-not-assigned, no-value-for-parameter
 
-    absl.logging.info('Examples generated.')
+    logging.info('Examples generated.')
