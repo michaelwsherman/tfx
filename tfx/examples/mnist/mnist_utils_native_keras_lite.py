@@ -40,10 +40,7 @@ def _get_serve_tf_examples_fn(model, tf_transform_output):
   @tf.function
   def serve_tf_examples_fn(image_tensor):
     """Returns the output to be used in the serving signature."""
-    transformed_features = tf_transform_output.transform_raw_features(
-        {base.IMAGE_KEY: image_tensor})
-    # TODO(b/148082271): Remove this line once TFT 0.22 is used.
-    transformed_features.pop(base.transformed_name(base.LABEL_KEY), None)
+    transformed_features = model.tft_layer({base.IMAGE_KEY: image_tensor})
 
     return model(transformed_features)
 
