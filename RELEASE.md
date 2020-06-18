@@ -13,9 +13,6 @@
     comprehensive solution for idempotent execution.
 *   Made evaluator output optional (while still recommended) for pusher.
 *   Moved BigQueryExampleGen to `tfx.extensions.google_cloud_big_query`.
-*   Removed Tuner from custom_components/ as it's supported under components/
-    now.
-
 ## Breaking changes
 
 ### For pipeline authors
